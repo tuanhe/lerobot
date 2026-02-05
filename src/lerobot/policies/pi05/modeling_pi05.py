@@ -1140,6 +1140,9 @@ class PI05Policy(PreTrainedPolicy):
         # Get device from model parameters
         device = next(self.parameters()).device
 
+        batch["observation.images.base_0_rgb"] = batch["observation.images.image"]
+        batch["observation.images.left_wrist_0_rgb"] = batch["observation.images.image2"]
+        
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
 

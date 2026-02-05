@@ -241,7 +241,12 @@ def make_pre_post_processors(
         NotImplementedError: If a processor factory is not implemented for the given
             policy configuration type.
     """
+    
+    print(f"Code is here   policy_cfg: {policy_cfg} ")
     if pretrained_path:
+        
+        print(f"Code is here   policy_cfg: {policy_cfg} ")
+        
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step

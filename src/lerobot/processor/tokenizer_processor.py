@@ -106,7 +106,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
-            self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            tokenizer_name = "/home/x/Documents/models/paligemma-3b-pt-224/"
+            self.input_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
