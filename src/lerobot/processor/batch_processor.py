@@ -228,6 +228,7 @@ class AddBatchDimensionProcessorStep(ProcessorStep):
         Returns:
             The environment transition with a batch dimension added.
         """
+        print(f"Just called here to chechk wahahah ")
         if transition[TransitionKey.ACTION] is not None:
             transition = self.to_batch_action_processor(transition)
         if transition[TransitionKey.OBSERVATION] is not None:

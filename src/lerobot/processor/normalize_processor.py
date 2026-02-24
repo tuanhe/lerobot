@@ -445,6 +445,7 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = transition.copy()
 
+        print(f"嗯前处理到这里了")
         # Handle observation normalization.
         observation = new_transition.get(TransitionKey.OBSERVATION)
         if observation is not None:
@@ -508,7 +509,7 @@ class UnnormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = transition.copy()
-
+        print(f"this is normazlize proseesor")
         # Handle observation unnormalization.
         observation = new_transition.get(TransitionKey.OBSERVATION)
         if observation is not None:

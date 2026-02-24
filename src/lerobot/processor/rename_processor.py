@@ -41,6 +41,7 @@ class RenameObservationsProcessorStep(ObservationProcessorStep):
     rename_map: dict[str, str] = field(default_factory=dict)
 
     def observation(self, observation):
+        print(f"Called here 123 observation")
         processed_obs = {}
         for key, value in observation.items():
             if key in self.rename_map:

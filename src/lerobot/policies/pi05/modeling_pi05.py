@@ -563,6 +563,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        # Precompute sinusoidal position embedding scaling factors (avoid recomputing each denoising step)
+        dim = action_expert_config.width
+        fraction = torch.linspace(0.0, 1.0, dim // 2, dtype=torch.float64)
+        period = config.min_period * (config.max_period / config.min_period) ** fraction
+        scaling_factor = (1.0 / period * 2 * math.pi).float()
+        self.register_buffer("_sin_scaling_factor", scaling_factor, persistent=False)
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -599,6 +606,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
 
+    def enable_bfloat16_inference(self):
+        """Convert model weights to bfloat16 for faster inference.
+
+        Call this after from_pretrained() to halve memory usage and speed up matmuls.
+        Keeps normalization layers and embeddings in float32 for numerical stability.
+        """
+        self.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        for module in [self.action_in_proj, self.action_out_proj, self.time_mlp_in, self.time_mlp_out]:
+            module.to(dtype=torch.bfloat16)
+        logging.info("Converted PI05Pytorch to bfloat16 for inference")
+
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
@@ -613,7 +631,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+        mask = torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+        # Cast to model dtype so bfloat16 inference works with eager attention
+        model_dtype = next(self.paligemma_with_expert.paligemma.language_model.parameters()).dtype
+        return mask.to(dtype=model_dtype)
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -680,15 +701,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks = []
         att_masks = []
 
-        # Embed timestep using sine-cosine positional encoding
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=timestep.device,
-        )
-        time_emb = time_emb.type(dtype=timestep.dtype)
+        # Embed timestep using precomputed sine-cosine positional encoding (cached scaling factors)
+        sin_input = self._sin_scaling_factor[None, :] * timestep[:, None].float()
+        time_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+
+        # Cast inputs to match projection layer dtype (handles float32 / bfloat16)
+        proj_dtype = self.action_in_proj.weight.dtype
+        noisy_actions = noisy_actions.to(dtype=proj_dtype)
+        time_emb = time_emb.to(dtype=proj_dtype)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -704,7 +724,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
         action_time_emb = action_emb
-        adarms_cond = time_emb
+        # input_layernorm.dense is kept in float32 for numerical stability,
+        # so adarms_cond must also be float32 regardless of the compute dtype
+        adarms_cond = time_emb.to(dtype=torch.float32)
 
         embs.append(action_time_emb)
         bsize, action_time_dim = action_time_emb.shape[:2]
@@ -776,7 +798,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
+    @torch.inference_mode()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
         self,
         images,
@@ -891,7 +913,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)
 
 
@@ -1128,6 +1150,10 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    def enable_bfloat16_inference(self):
+        """Convert model to bfloat16 for faster inference. Call after from_pretrained()."""
+        self.model.enable_bfloat16_inference()
+
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
@@ -1202,7 +1228,7 @@ class PI05Policy(PreTrainedPolicy):
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
         return actions
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
         assert not self._rtc_enabled(), (
@@ -1219,7 +1245,7 @@ class PI05Policy(PreTrainedPolicy):
 
         return self._action_queue.popleft()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
