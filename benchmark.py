@@ -2,8 +2,16 @@
 import time
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.pi05 import PI05Policy
+from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
+from lerobot.processor import (
+    AddBatchDimensionProcessorStep,
+    DeviceProcessorStep,
+    NormalizerProcessorStep,
+    PolicyProcessorPipeline,
+    RenameObservationsProcessorStep,
+    TokenizerProcessorStep,
+)
 
 model_id = "/home/x/Documents/models/lerobot/pi05_base/"
 device = torch.device("cuda")
@@ -11,10 +19,27 @@ device = torch.device("cuda")
 
 def load_policy():
     policy = PI05Policy.from_pretrained(model_id).to(device).eval()
-    preprocess, _ = make_pre_post_processors(
-        policy.config, model_id,
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
+    cfg = policy.config
+
+    preprocess = PolicyProcessorPipeline(
+        steps=[
+            RenameObservationsProcessorStep(rename_map={}),
+            AddBatchDimensionProcessorStep(),
+            NormalizerProcessorStep(
+                features={**cfg.input_features, **cfg.output_features},
+                norm_map=cfg.normalization_mapping,
+            ),
+            Pi05PrepareStateTokenizerProcessorStep(max_state_dim=cfg.max_state_dim),
+            TokenizerProcessorStep(
+                tokenizer_name="google/paligemma-3b-pt-224",
+                max_length=cfg.tokenizer_max_length,
+                padding_side="right",
+                padding="max_length",
+            ),
+            DeviceProcessorStep(device=str(device)),
+        ],
     )
+
     return policy, preprocess
 
 

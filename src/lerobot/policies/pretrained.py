@@ -16,14 +16,12 @@ import builtins
 import dataclasses
 import logging
 import os
-from importlib.resources import files
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TypedDict, TypeVar
 
 import packaging
 import safetensors
-from huggingface_hub import HfApi, ModelCard, ModelCardData, hf_hub_download
+from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import load_model as load_model_as_safetensor, save_model as save_model_as_safetensor
@@ -31,7 +29,6 @@ from torch import Tensor, nn
 from typing_extensions import Unpack
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.utils import log_model_loading_keys
 from lerobot.utils.hub import HubMixin
 
@@ -203,69 +200,6 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         with caching.
         """
         raise NotImplementedError
-
-    def push_model_to_hub(
-        self,
-        cfg: TrainPipelineConfig,
-        peft_model=None,
-    ):
-        api = HfApi()
-        repo_id = api.create_repo(
-            repo_id=self.config.repo_id, private=self.config.private, exist_ok=True
-        ).repo_id
-
-        # Push the files to the repo in a single commit
-        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            saved_path = Path(tmp) / repo_id
-
-            if peft_model is not None:
-                # Since PEFT just forwards calls to `push_model_to_hub`, `self` is not the PeftModel wrapper
-                # but the actual policy which is why we need the PEFT model passed to us to save the adapter.
-                # That also means that we need to store the policy config ourselves since PEFT can't.
-                peft_model.save_pretrained(saved_path)
-                self.config.save_pretrained(saved_path)
-            else:
-                self.save_pretrained(saved_path)  # Calls _save_pretrained and stores model tensors
-
-            card = self.generate_model_card(
-                cfg.dataset.repo_id, self.config.type, self.config.license, self.config.tags
-            )
-            card.save(str(saved_path / "README.md"))
-
-            cfg.save_pretrained(saved_path)  # Calls _save_pretrained and stores train config
-
-            commit_info = api.upload_folder(
-                repo_id=repo_id,
-                repo_type="model",
-                folder_path=saved_path,
-                commit_message="Upload policy weights, train config and readme",
-                allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"],
-                ignore_patterns=["*.tmp", "*.log"],
-            )
-
-            logging.info(f"Model pushed to {commit_info.repo_url.url}")
-
-    def generate_model_card(
-        self, dataset_repo_id: str, model_type: str, license: str | None, tags: list[str] | None
-    ) -> ModelCard:
-        base_model = "lerobot/smolvla_base" if model_type == "smolvla" else None  # Set a base model
-
-        card_data = ModelCardData(
-            license=license or "apache-2.0",
-            library_name="lerobot",
-            pipeline_tag="robotics",
-            tags=list(set(tags or []).union({"robotics", "lerobot", model_type})),
-            model_name=model_type,
-            datasets=dataset_repo_id,
-            base_model=base_model,
-        )
-
-        template_card = (
-            files("lerobot.templates").joinpath("lerobot_modelcard_template.md").read_text(encoding="utf-8")
-        )
-        card = ModelCard.from_template(card_data, template_str=template_card)
-        card.validate()
-        return card
 
     def wrap_with_peft(
         self,
