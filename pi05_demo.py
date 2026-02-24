@@ -34,6 +34,8 @@ frame = dict(dataset[frame_index])
 print(f"frame_index : {frame_index}")
 print(f"frame length: {len(frame)}")
 
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
 
 batch = preprocess(frame)
 with torch.inference_mode():

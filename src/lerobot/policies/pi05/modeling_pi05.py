@@ -91,13 +91,6 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
 
-def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
-    alpha_t = torch.as_tensor(alpha, dtype=torch.float32, device=device)
-    beta_t = torch.as_tensor(beta, dtype=torch.float32, device=device)
-    dist = torch.distributions.Beta(alpha_t, beta_t)
-    return dist.sample((bsize,))
-
-
 def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (exact copy)
     """Copied from big_vision.
 
@@ -385,7 +378,6 @@ class PaliGemmaWithExpertModel(
         self.gemma_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
-        self._set_requires_grad()
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
@@ -408,23 +400,6 @@ class PaliGemmaWithExpertModel(
         for name, param in self.named_parameters():
             if any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
-
-    def _set_requires_grad(self):
-        if self.freeze_vision_encoder:
-            self.paligemma.vision_tower.eval()
-            for param in self.paligemma.vision_tower.parameters():
-                param.requires_grad = False
-        if self.train_expert_only:
-            self.paligemma.eval()
-            for param in self.paligemma.parameters():
-                param.requires_grad = False
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.freeze_vision_encoder:
-            self.paligemma.vision_tower.eval()
-        if self.train_expert_only:
-            self.paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
@@ -471,58 +446,22 @@ class PaliGemmaWithExpertModel(
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
-            # Check if gradient checkpointing is enabled for any of the models
-            use_gradient_checkpointing = (
-                hasattr(self.gemma_expert.model, "gradient_checkpointing")
-                and self.gemma_expert.model.gradient_checkpointing
-                and self.training
-            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
-
-            # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
-                if use_gradient_checkpointing:
-                    inputs_embeds = torch.utils.checkpoint.checkpoint(
-                        compute_layer_complete,
-                        layer_idx,
-                        inputs_embeds,
-                        attention_mask,
-                        position_ids,
-                        adarms_cond,
-                        use_reentrant=False,
-                        preserve_rng_state=False,
-                        paligemma=self.paligemma,
-                        gemma_expert=self.gemma_expert,
-                    )
-                else:
-                    inputs_embeds = compute_layer_complete(
-                        layer_idx,
-                        inputs_embeds,
-                        attention_mask,
-                        position_ids,
-                        adarms_cond,
-                        paligemma=self.paligemma,
-                        gemma_expert=self.gemma_expert,
-                    )
+                inputs_embeds = compute_layer_complete(
+                    layer_idx,
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    adarms_cond,
+                    paligemma=self.paligemma,
+                    gemma_expert=self.gemma_expert,
+                )
 
             # final norm
-            def compute_final_norms(inputs_embeds, adarms_cond):
-                outputs_embeds = []
-                for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
-                    outputs_embeds.append(out_emb)
-                return outputs_embeds
-
-            # Apply gradient checkpointing to final norm if enabled
-            if use_gradient_checkpointing:
-                outputs_embeds = torch.utils.checkpoint.checkpoint(
-                    compute_final_norms,
-                    inputs_embeds,
-                    adarms_cond,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            else:
-                outputs_embeds = compute_final_norms(inputs_embeds, adarms_cond)
+            outputs_embeds = []
+            for i, hidden_states in enumerate(inputs_embeds):
+                out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                outputs_embeds.append(out_emb)
 
             prefix_output = outputs_embeds[0]
             suffix_output = outputs_embeds[1]
@@ -563,16 +502,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # Initialize gradient checkpointing flag
-        self.gradient_checkpointing_enabled = False
-
-        # Compile model if requested
-        if config.compile_model:
-            torch.set_float32_matmul_precision("high")
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
-            # Also compile the main forward pass used during training
-            self.forward = torch.compile(self.forward, mode=config.compile_mode)
-
         msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
 
         try:
@@ -583,31 +512,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         except ImportError:
             raise ValueError(msg) from None
 
-    def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory optimization."""
-        self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
-        logging.info("Enabled gradient checkpointing for PI05Pytorch model")
-
-    def gradient_checkpointing_disable(self):
-        """Disable gradient checkpointing."""
-        self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
-        logging.info("Disabled gradient checkpointing for PI05Pytorch model")
-
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def _apply_checkpoint(self, func, *args, **kwargs):
-        """Helper method to apply gradient checkpointing if enabled."""
-        if self.gradient_checkpointing_enabled and self.training:
-            return torch.utils.checkpoint.checkpoint(
-                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
-            )
+        """Helper method that calls the function directly (gradient checkpointing removed)."""
         return func(*args, **kwargs)
 
     def _prepare_attention_masks_4d(self, att_2d_masks):
@@ -623,13 +532,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             dtype=torch.float32,
             device=device,
         )
-
-    def sample_time(self, bsize, device):
-        time_beta = sample_beta(
-            self.config.time_sampling_beta_alpha, self.config.time_sampling_beta_beta, bsize, device
-        )
-        time = time_beta * self.config.time_sampling_scale + self.config.time_sampling_offset
-        return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
         self, images, img_masks, tokens, masks
@@ -720,61 +622,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
-
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
-
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
-
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-
-        return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -917,10 +764,6 @@ class PI05Policy(PreTrainedPolicy):
         # Initialize the core PI05 model
         self.init_rtc_processor()
         self.model = PI05Pytorch(config, rtc_processor=self.rtc_processor)
-
-        # Enable gradient checkpointing if requested
-        if config.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
 
@@ -1102,9 +945,6 @@ class PI05Policy(PreTrainedPolicy):
 
         return fixed_state_dict
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
-
     def reset(self):
         """Reset internal state - called when environment resets."""
         self._action_queue = deque(maxlen=self.config.n_action_steps)
@@ -1197,11 +1037,6 @@ class PI05Policy(PreTrainedPolicy):
 
         return images, img_masks
 
-    def prepare_action(self, batch):
-        """Pad action"""
-        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
-        return actions
-
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
@@ -1236,51 +1071,3 @@ class PI05Policy(PreTrainedPolicy):
         actions = actions[:, :, :original_action_dim]
 
         return actions
-
-    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
-        """Run the batch through the model and compute the loss for training.
-
-        Args:
-            batch: Training batch containing observations and actions.
-            reduction: How to reduce the loss. Options:
-                - "mean": Return scalar mean loss (default, backward compatible)
-                - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
-        """
-        # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
-        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-
-        actions = self.prepare_action(batch)
-
-        # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
-
-        # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
-
-        loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-        }
-
-        if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
-        else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
-
-    def _get_default_peft_targets(self) -> dict[str, any]:
-        """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        )
-        target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
-        return {
-            "target_modules": target_modules,
-            "modules_to_save": [],
-        }
